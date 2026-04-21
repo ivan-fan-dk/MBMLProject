@@ -1,61 +1,42 @@
 from pyro.ops.indexing import Vindex
 
-def model(X_obs, Y_obs, obs_id, alt_id, n_alts=3):
+def model(X_long, alt_id, obs_id, choice_long, person_id, n_alts=3, K=5):
     """
-    Bayesian Multinomial Logit Model in Pyro
-    
-    Parameters:
-    - X_obs: (n_obs, n_features) alternative attributes in long format
-    - Y_obs: (n_obs, 1) choice indicator in long format (1 if chosen, 0 otherwise)
-    - beta: (n_classes, n_features) parameter multiplier
-    - asc: (n_classes, n_alts) 
-    - q: (n_person, n_classes) contains binary variables. q_{i,j} indicates whether i'th person belong to j class
-    
-    - obs_id: observation ID for grouping alternatives
-    - alt_id: alternative ID (0, 1, 2)
-    - n_alts: number of alternatives (3: Train, SwissMetro, Car)
-    - V: (N_alts,) linear utility function: V_i = X_i @ beta + ASC_i
+    Bayesian Latent Class Multinomial Logit (LCCM)
+    - X_long:     (N_long, n_features)  ← tt, cost (standardized)
+    - alt_id:     (N_long,)             ← 0=Train, 1=SwissMetro, 2=Car
+    - obs_id:     (N_long,)             ← choice situation ID
+    - choice_long:(N_long,)             ← 0 or 1 (chosen)
+    - person_id:  (N_long,)             ← person ID (important!)
     """
-    n_obs, n_features = X_obs.shape
-    n_ids = len(obs_id.unique())
-    K = 5
+    N_long = X_long.shape[0]
+    n_persons = len(torch.unique(person_id))
 
-    # Priors on coefficients: explicitly expand to vector
-    with pyro.plate('Number of classes', K):
-        # (n_classes, n_features)
-        betas = pyro.sample('beta', dist.MultivariateNormal(torch.zeros(n_features), torch.eye(n_features)))
-    
-        # Alternative-specific constants: fix first to 0 for identification
-        # Sample only for alternatives 1 and 2
-        # (K, n_alts-1)
-        ascs_free = pyro.sample('asc', dist.MultivariateNormal(torch.zeros(n_alts - 1), torch.eye(n_alts - 1)))
+    # === Priors on class-specific parameters ===
+    with pyro.plate("classes", K):
+        beta = pyro.sample("beta", dist.Normal(0., 5.).expand([X_long.shape[1]]).to_event(1))
+        asc_free = pyro.sample("asc", dist.Normal(0., 5.).expand([n_alts-1]).to_event(1))
+        asc = torch.cat([torch.zeros(K, 1), asc_free], dim=1)   # fix ASC for alt 0 = 0
 
-    # (K, n_alts): fix first ASC to 0 for identification
-    zero_col = torch.zeros(K, 1)
-    ascs = torch.cat([zero_col, ascs_free], dim=-1)
-    
-    # Likelihood: categorical (multinomial logit)
-    with pyro.plate('Number of people', n_ids):
-        # (n_obs, 1)
-        Q = pyro.sample("q", dist.Categorical(torch.ones(K)/K)) # TODO obs is needed here.
-    
-    Q_obs = Q[..., obs_id]
-    
-    # Shape: (..., n_obs, n_features)
-    beta_obs = Vindex(betas)[..., Q_obs, :]
-    
-    # Shape: (..., n_obs, n_alts)
-    asc_obs = Vindex(ascs)[..., Q_obs, :]
+    # === Class assignment per person (shared across all observations of that person) ===
+    with pyro.plate("persons", n_persons):
+        q = pyro.sample("q", dist.Categorical(torch.ones(K) / K))   # q.shape = (n_persons,)
 
-    # (n_obs,) <- (n_obs, n_features) * (n_obs, n_features)
-    X_deterministic = y = pyro.deterministic("X", X_obs)
-    
-    U = torch.sum(X_deterministic * beta_obs, dim=-1)
-    
-    # (n_obs, n_alts) <- (n_obs, n_alts) + (n_obs, 1)
-    V = asc_obs + U[:, None]
-    
-    with pyro.plate('Number of observations', n_obs):
-        y = pyro.sample('y', dist.Categorical(logits=V[obs_id]), obs=Y_obs)
+    # === Get class for every long-format row ===
+    q_long = q[person_id]                     # (N_long,)
 
-pyro.render_model(model, model_args=(X, Y, obs_id, alt_id), render_distributions=True, render_deterministic=True, render_params=True)
+    # === Class-specific parameters for each row ===
+    beta_long = Vindex(beta)[..., q_long, :]   # (N_long, n_features)
+    asc_long  = Vindex(asc)[..., q_long, :]    # (N_long, n_alts)
+
+    # === Linear predictor per alternative ===
+    linear = (X_long * beta_long).sum(dim=-1)          # (N_long,)
+
+    # Add the correct ASC for this alternative
+    V_row = linear + asc_long[torch.arange(N_long), alt_id]   # (N_long,)
+
+    # === Likelihood: one choice per observation (obs_id) ===
+    with pyro.plate("observations", N_long):
+        # We use the long-format Bernoulli trick for MNL
+        # (works very well and is numerically stable)
+        pyro.sample("choice", dist.Bernoulli(logits=V_row), obs=choice_long)
