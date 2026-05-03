@@ -1,0 +1,123 @@
+Using device: cuda
+   GROUP  SURVEY  SP  ID  PURPOSE  ...  SM_HE  SM_SEATS  CAR_TT  CAR_CO  CHOICE
+0      2       0   1   1        1  ...     20         0     117      65       2
+1      2       0   1   1        1  ...     10         0     117      84       2
+2      2       0   1   1        1  ...     30         0     117      52       2
+3      2       0   1   1        1  ...     20         0      72      52       2
+4      2       0   1   1        1  ...     20         0      90      84       2
+
+[5 rows x 28 columns]
+(10728, 28)
+Filtered shape: (10692, 28)
+Train shape: (8550, 28)
+Test shape: (2142, 28)
+Train persons: 950
+Test persons: 238
+
+--- Fitting K=2 ---
+[K=2] step    0 | ELBO loss = 72,152.05
+[K=2] step  333 | ELBO loss = 8,004.93
+[K=2] step  666 | ELBO loss = 7,751.62
+[K=2] step  999 | ELBO loss = 7,381.40
+
+--- Fitting K=3 ---
+[K=3] step    0 | ELBO loss = 95,567.46
+[K=3] step  333 | ELBO loss = 8,944.93
+[K=3] step  666 | ELBO loss = 8,095.67
+[K=3] step  999 | ELBO loss = 7,910.16
+
+--- Fitting K=4 ---
+[K=4] step    0 | ELBO loss = 128,280.14
+[K=4] step  333 | ELBO loss = 9,472.36
+[K=4] step  666 | ELBO loss = 8,678.08
+[K=4] step  999 | ELBO loss = 8,199.61
+
+--- Fitting K=5 ---
+[K=5] step    0 | ELBO loss = 154,110.04
+[K=5] step  333 | ELBO loss = 10,205.28
+[K=5] step  666 | ELBO loss = 9,504.20
+[K=5] step  999 | ELBO loss = 8,907.86
+
+--- Fitting K=6 ---
+[K=6] step    0 | ELBO loss = 190,772.81
+[K=6] step  333 | ELBO loss = 11,171.99
+[K=6] step  666 | ELBO loss = 10,183.24
+[K=6] step  999 | ELBO loss = 9,669.70
+
+--- Fitting K=7 ---
+[K=7] step    0 | ELBO loss = 206,088.43
+[K=7] step  333 | ELBO loss = 12,136.34
+[K=7] step  666 | ELBO loss = 11,315.11
+[K=7] step  999 | ELBO loss = 10,385.11
+
+--- Fitting K=8 ---
+[K=8] step    0 | ELBO loss = 248,008.44
+[K=8] step  333 | ELBO loss = 13,539.96
+[K=8] step  666 | ELBO loss = 12,306.69
+[K=8] step  999 | ELBO loss = 10,976.26
+
+--- Fitting K=9 ---
+[K=9] step    0 | ELBO loss = 264,847.49
+[K=9] step  333 | ELBO loss = 14,718.04
+[K=9] step  666 | ELBO loss = 13,239.88
+[K=9] step  999 | ELBO loss = 11,879.39
+
+Model comparison table (K=2..9):
+ K  n_params  log_likelihood          AIC          BIC  prediction_LL      test_LL  test_accuracy
+ 2        12    -7124.416197 14272.832393 14357.476632   -1640.800951 -1640.800951       0.599907
+ 3        18    -7459.608579 14955.217157 15082.183515   -1730.099124 -1730.099124       0.610177
+ 4        24    -7218.647925 14485.295851 14654.584328   -1671.100653 -1671.100653       0.634454
+ 5        30    -7250.826972 14561.653944 14773.264540   -1665.405929 -1665.405929       0.634921
+ 6        36    -7288.904172 14649.808345 14903.741061   -1681.183898 -1681.183898       0.639122
+ 7        42    -7308.627520 14701.255041 14997.509876   -1679.193640 -1679.193640       0.642857
+ 8        48    -7250.133247 14596.266495 14934.843450   -1663.445231 -1663.445231       0.629785
+ 9        54    -7296.525795 14701.051591 15081.950665   -1675.150294 -1675.150294       0.634454
+
+Best by prediction_LL:
+ K  prediction_LL  test_accuracy
+ 2   -1640.800951       0.599907
+
+Best by test_accuracy:
+ K  prediction_LL  test_accuracy
+ 7    -1679.19364       0.642857
+
+============================================================
+Saving best model by prediction_LL (K=2)
+============================================================
+
+Model K=2 interpretation:
+Best model by predictive performance uses K=2 latent classes.
+Class interpretation:
+- Class 1: share=0.497, non-car segment; TT=-0.467 (time sensitivity rank 2/2), Cost=-0.208 (cost sensitivity rank 2/2), ASC(Car)=-1.726 (car preference rank 2/2), VOT=28.042 CHF/min.
+- Class 2: share=0.503, car-preferring segment; TT=-1.384 (time sensitivity rank 1/2), Cost=-9.374 (cost sensitivity rank 1/2), ASC(Car)=2.362 (car preference rank 1/2), VOT=1.843 CHF/min.
+Interpretation note: more negative Travel Time/Travel Cost coefficients imply stronger disutility.
+VOT is computed as (dU/dTT)/(dU/dCost) after converting from scaled units to raw minutes and CHF.
+
+============================================================
+Saving best model by test_accuracy (K=7)
+============================================================
+
+Model K=7 interpretation:
+Best model by predictive performance uses K=7 latent classes.
+Class interpretation:
+- Class 1: share=0.144, car-preferring segment; TT=-3.010 (time sensitivity rank 4/7), Cost=-3.076 (cost sensitivity rank 2/7), ASC(Car)=3.330 (car preference rank 2/7), VOT=12.212 CHF/min.
+- Class 2: share=0.142, car-preferring segment; TT=-3.968 (time sensitivity rank 2/7), Cost=-0.850 (cost sensitivity rank 5/7), ASC(Car)=0.591 (car preference rank 5/7), VOT=58.241 CHF/min.
+- Class 3: share=0.143, car-preferring segment; TT=-0.362 (time sensitivity rank 6/7), Cost=-2.115 (cost sensitivity rank 3/7), ASC(Car)=3.794 (car preference rank 1/7), VOT=2.135 CHF/min.
+- Class 4: share=0.144, non-car segment; TT=-3.528 (time sensitivity rank 3/7), Cost=-0.140 (cost sensitivity rank 7/7), ASC(Car)=-2.202 (car preference rank 6/7), VOT=313.719 CHF/min. [VOT may be unstable (cost coefficient near zero);]
+- Class 5: share=0.143, car-preferring segment; TT=-0.695 (time sensitivity rank 5/7), Cost=-7.357 (cost sensitivity rank 1/7), ASC(Car)=1.384 (car preference rank 4/7), VOT=1.179 CHF/min.
+- Class 6: share=0.143, non-car segment; TT=-0.247 (time sensitivity rank 7/7), Cost=-0.272 (cost sensitivity rank 6/7), ASC(Car)=-2.781 (car preference rank 7/7), VOT=11.340 CHF/min.
+- Class 7: share=0.142, car-preferring segment; TT=-5.115 (time sensitivity rank 1/7), Cost=-1.759 (cost sensitivity rank 4/7), ASC(Car)=2.036 (car preference rank 3/7), VOT=36.298 CHF/min.
+Interpretation note: more negative Travel Time/Travel Cost coefficients imply stronger disutility.
+VOT is computed as (dU/dTT)/(dU/dCost) after converting from scaled units to raw minutes and CHF.
+
+============================================================
+All saved files:
+============================================================
+- outputs/gp_lccm_comparison_k2_to_k9.csv
+- outputs/gp_lccm_class_profiles_long.csv
+- outputs/gp_lccm_best_model_profile_K2.csv
+- outputs/gp_lccm_person_class_probs_bestK2.csv
+- outputs/gp_lccm_best_model_interpretation_K2.txt
+- outputs/gp_lccm_best_model_profile_K7.csv
+- outputs/gp_lccm_person_class_probs_bestK7.csv
+- outputs/gp_lccm_best_model_interpretation_K7.txt

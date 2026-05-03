@@ -1,0 +1,11 @@
+Best model by predictive performance uses K=7 latent classes.
+Class interpretation:
+- Class 1: share=0.144, car-preferring segment; TT=-3.010 (time sensitivity rank 4/7), Cost=-3.076 (cost sensitivity rank 2/7), ASC(Car)=3.330 (car preference rank 2/7), VOT=12.212 CHF/min.
+- Class 2: share=0.142, car-preferring segment; TT=-3.968 (time sensitivity rank 2/7), Cost=-0.850 (cost sensitivity rank 5/7), ASC(Car)=0.591 (car preference rank 5/7), VOT=58.241 CHF/min.
+- Class 3: share=0.143, car-preferring segment; TT=-0.362 (time sensitivity rank 6/7), Cost=-2.115 (cost sensitivity rank 3/7), ASC(Car)=3.794 (car preference rank 1/7), VOT=2.135 CHF/min.
+- Class 4: share=0.144, non-car segment; TT=-3.528 (time sensitivity rank 3/7), Cost=-0.140 (cost sensitivity rank 7/7), ASC(Car)=-2.202 (car preference rank 6/7), VOT=313.719 CHF/min. [VOT may be unstable (cost coefficient near zero);]
+- Class 5: share=0.143, car-preferring segment; TT=-0.695 (time sensitivity rank 5/7), Cost=-7.357 (cost sensitivity rank 1/7), ASC(Car)=1.384 (car preference rank 4/7), VOT=1.179 CHF/min.
+- Class 6: share=0.143, non-car segment; TT=-0.247 (time sensitivity rank 7/7), Cost=-0.272 (cost sensitivity rank 6/7), ASC(Car)=-2.781 (car preference rank 7/7), VOT=11.340 CHF/min.
+- Class 7: share=0.142, car-preferring segment; TT=-5.115 (time sensitivity rank 1/7), Cost=-1.759 (cost sensitivity rank 4/7), ASC(Car)=2.036 (car preference rank 3/7), VOT=36.298 CHF/min.
+Interpretation note: more negative Travel Time/Travel Cost coefficients imply stronger disutility.
+VOT is computed as (dU/dTT)/(dU/dCost) after converting from scaled units to raw minutes and CHF.

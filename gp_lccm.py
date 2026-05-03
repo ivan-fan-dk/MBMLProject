@@ -12,6 +12,16 @@ from scipy.special import logsumexp
 from sklearn.model_selection import train_test_split
 
 
+# Device setup - use GPU if available
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}")
+
+# Set Pyro to use GPU
+if torch.cuda.is_available():
+    pyro.enable_validation(False)
+    # Set default tensor type to CUDA tensor
+    torch.set_default_device(DEVICE)
+
 # Reproducibility
 np.random.seed(11)
 torch.manual_seed(11)
@@ -170,12 +180,12 @@ def prepare_lccm_data(long_df, id_col="ID", include_GA=True, reference_Z_cols=No
 
 def to_torch_lccm(data):
     return {
-        "X": torch.tensor(np.column_stack([data["tt"], data["co"]]), dtype=torch.float32),
-        "obs_id": torch.tensor(data["obs_id"], dtype=torch.long),
-        "alt_id": torch.tensor(data["alt_id"], dtype=torch.long),
-        "choice": torch.tensor(data["choice"], dtype=torch.float32),
-        "person_obs_id": torch.tensor(data["person_obs_id"], dtype=torch.long),
-        "Z": torch.tensor(data["Z"], dtype=torch.float32),
+        "X": torch.tensor(np.column_stack([data["tt"], data["co"]]), dtype=torch.float32, device=DEVICE),
+        "obs_id": torch.tensor(data["obs_id"], dtype=torch.long, device=DEVICE),
+        "alt_id": torch.tensor(data["alt_id"], dtype=torch.long, device=DEVICE),
+        "choice": torch.tensor(data["choice"], dtype=torch.float32, device=DEVICE),
+        "person_obs_id": torch.tensor(data["person_obs_id"], dtype=torch.long, device=DEVICE),
+        "Z": torch.tensor(data["Z"], dtype=torch.float32, device=DEVICE),
         "n_obs": data["n_obs"],
         "n_alts": data["n_alts"],
         "n_persons": data["n_persons"],
@@ -210,10 +220,12 @@ def lccm_pyro_model(
         "kappa",
         dist.LogNormal(0.0, 0.5).expand([K]).to_event(1),
     )
+    kappa = kappa.to(device=Z.device, dtype=Z.dtype)
     lengthscale = pyro.sample(
         "lengthscale",
         dist.LogNormal(0.0, 0.5).expand([K]).to_event(1),
     )
+    lengthscale = lengthscale.to(device=Z.device, dtype=Z.dtype)
 
     f_list = []
     eye = torch.eye(n_persons, dtype=Z.dtype, device=Z.device)
@@ -237,17 +249,20 @@ def lccm_pyro_model(
             "beta_raw",
             dist.Normal(0.0, 1.0).expand([K, n_features]).to_event(2),
         )
+        beta_raw = beta_raw.to(device=X.device, dtype=X.dtype)
         beta = -torch.nn.functional.softplus(beta_raw)
     else:
         beta = pyro.sample(
             "beta",
             dist.Normal(0.0, 2.0).expand([K, n_features]).to_event(2),
         )
+        beta = beta.to(device=X.device, dtype=X.dtype)
 
     asc_raw = pyro.sample(
         "asc_raw",
         dist.Normal(0.0, 1.0).expand([K, n_alts - 1]).to_event(2),
     )
+    asc_raw = asc_raw.to(device=X.device, dtype=X.dtype)
     asc_full = torch.cat([torch.zeros(K, 1, dtype=X.dtype, device=X.device), asc_raw], dim=1)
 
     chosen_mask = choice > 0.5
@@ -496,7 +511,7 @@ def interpret_best_model(K, profile_df):
 
 
 # %%
-def fit_and_evaluate_k(train_data, test_data, K, prior_withconstraints=True, n_steps=250):
+def fit_and_evaluate_k(train_data, test_data, K, prior_withconstraints=True, n_steps=1000):
     train_torch = to_torch_lccm(train_data)
 
     pyro.clear_param_store()
@@ -543,7 +558,7 @@ def fit_and_evaluate_k(train_data, test_data, K, prior_withconstraints=True, n_s
             train_torch["n_alts"],
             train_torch["n_persons"],
         )
-        if step % 100 == 0 or step == n_steps - 1:
+        if step % max(1, n_steps // 3) == 0 or step == n_steps - 1:
             print(f"[K={K}] step {step:4d} | ELBO loss = {loss:,.2f}")
 
     posterior = guide.median(
@@ -745,7 +760,8 @@ def main():
 
     best_pred_idx = results_df["prediction_LL"].idxmax()
     best_acc_idx = results_df["test_accuracy"].idxmax()
-    best_k = int(results_df.loc[best_pred_idx, "K"])
+    best_k_pred = int(results_df.loc[best_pred_idx, "K"])
+    best_k_acc = int(results_df.loc[best_acc_idx, "K"])
 
     print("\nBest by prediction_LL:")
     print(results_df.loc[[best_pred_idx], ["K", "prediction_LL", "test_accuracy"]].to_string(index=False))
@@ -753,44 +769,54 @@ def main():
     print("\nBest by test_accuracy:")
     print(results_df.loc[[best_acc_idx], ["K", "prediction_LL", "test_accuracy"]].to_string(index=False))
 
-    best_profile_df = profile_tables[best_k]
-    best_profile_path = output_dir / f"gp_lccm_best_model_profile_K{best_k}.csv"
-    best_profile_df.to_csv(best_profile_path, index=True)
+    # Save both best models
+    saved_files = [comparison_csv, profile_long_csv]
 
-    best_fit = fit_results[best_k]
-    person_prob_rows = []
+    for model_name, best_k in [("prediction_LL", best_k_pred), ("test_accuracy", best_k_acc)]:
+        print(f"\n{'='*60}")
+        print(f"Saving best model by {model_name} (K={best_k})")
+        print('='*60)
 
-    for dataset_name, dataset_data, probs in [
-        ("train", train_data, best_fit["train_class_probs"]),
-        ("test", test_data, best_fit["test_class_probs"]),
-    ]:
-        for idx, person_id in enumerate(dataset_data["person_ids"]):
-            row = {
-                "dataset": dataset_name,
-                "ID": person_id,
-                "predicted_class": int(np.argmax(probs[idx]) + 1),
-            }
-            for k in range(probs.shape[1]):
-                row[f"class_{k + 1}_prob"] = float(probs[idx, k])
-            person_prob_rows.append(row)
+        best_profile_df = profile_tables[best_k]
+        best_profile_path = output_dir / f"gp_lccm_best_model_profile_K{best_k}.csv"
+        best_profile_df.to_csv(best_profile_path, index=True)
+        saved_files.append(best_profile_path)
 
-    person_prob_df = pd.DataFrame(person_prob_rows)
-    person_prob_csv = output_dir / f"gp_lccm_person_class_probs_bestK{best_k}.csv"
-    person_prob_df.to_csv(person_prob_csv, index=False)
+        best_fit = fit_results[best_k]
+        person_prob_rows = []
 
-    interpretation_text = interpret_best_model(best_k, best_profile_df)
-    interpretation_path = output_dir / f"gp_lccm_best_model_interpretation_K{best_k}.txt"
-    interpretation_path.write_text(interpretation_text)
+        for dataset_name, dataset_data, probs in [
+            ("train", train_data, best_fit["train_class_probs"]),
+            ("test", test_data, best_fit["test_class_probs"]),
+        ]:
+            for idx, person_id in enumerate(dataset_data["person_ids"]):
+                row = {
+                    "dataset": dataset_name,
+                    "ID": person_id,
+                    "predicted_class": int(np.argmax(probs[idx]) + 1),
+                }
+                for k in range(probs.shape[1]):
+                    row[f"class_{k + 1}_prob"] = float(probs[idx, k])
+                person_prob_rows.append(row)
 
-    print("\nBest model interpretation:")
-    print(interpretation_text)
+        person_prob_df = pd.DataFrame(person_prob_rows)
+        person_prob_csv = output_dir / f"gp_lccm_person_class_probs_bestK{best_k}.csv"
+        person_prob_df.to_csv(person_prob_csv, index=False)
+        saved_files.append(person_prob_csv)
 
-    print("\nSaved files:")
-    print(f"- {comparison_csv}")
-    print(f"- {profile_long_csv}")
-    print(f"- {best_profile_path}")
-    print(f"- {person_prob_csv}")
-    print(f"- {interpretation_path}")
+        interpretation_text = interpret_best_model(best_k, best_profile_df)
+        interpretation_path = output_dir / f"gp_lccm_best_model_interpretation_K{best_k}.txt"
+        interpretation_path.write_text(interpretation_text)
+        saved_files.append(interpretation_path)
+
+        print(f"\nModel K={best_k} interpretation:")
+        print(interpretation_text)
+
+    print("\n" + "="*60)
+    print("All saved files:")
+    print("="*60)
+    for f in saved_files:
+        print(f"- {f}")
 
 
 if __name__ == "__main__":
