@@ -4,6 +4,7 @@ import pandas as pd
 import torch
 import pyro
 import pyro.distributions as dist
+from pathlib import Path
 from pyro.infer import SVI, Trace_ELBO
 from pyro.infer.autoguide import AutoNormal
 from pyro.optim import ClippedAdam
@@ -330,6 +331,111 @@ def parameter_count(K, n_alts, n_Z):
     return K * 2 + K * (n_alts - 1) + (K - 1) * (n_Z + 1)
 
 
+def class_probs_and_shares(data, gamma):
+    n_persons = data["n_persons"]
+    Z_aug = np.column_stack([np.ones(n_persons), data["Z"]])
+    eta_nonbase = Z_aug @ gamma.T
+    eta = np.column_stack([eta_nonbase, np.zeros(n_persons)])
+    class_probs = np.exp(eta - logsumexp(eta, axis=1, keepdims=True))
+    class_share = class_probs.mean(axis=0)
+    return class_probs, class_share
+
+
+def class_profile_table(beta, asc_raw, class_share, tt_std, co_std):
+    """Build attribute-by-class table requested by user."""
+    K = beta.shape[0]
+    columns = [f"Class {k + 1}" for k in range(K)]
+
+    asc_train = np.zeros(K)
+    asc_car = asc_raw[:, 1]
+    travel_time = beta[:, 0]
+    travel_cost = beta[:, 1]
+
+    vot = (travel_time / tt_std) / (travel_cost / co_std)
+
+    profile = pd.DataFrame(
+        {
+            col: [
+                asc_train[i],
+                asc_car[i],
+                travel_time[i],
+                travel_cost[i],
+                class_share[i],
+                vot[i],
+            ]
+            for i, col in enumerate(columns)
+        },
+        index=[
+            "ASC (Train)",
+            "ASC (Car)",
+            "Travel Time",
+            "Travel Cost",
+            "Class Share",
+            "VOT (CHF/min)",
+        ],
+    )
+
+    return profile
+
+
+def interpret_best_model(K, profile_df):
+    """Generate concise interpretation text for the selected best model."""
+    class_cols = list(profile_df.columns)
+
+    tt_vals = np.array([profile_df.loc["Travel Time", c] for c in class_cols])
+    cost_vals = np.array([profile_df.loc["Travel Cost", c] for c in class_cols])
+    asc_car_vals = np.array([profile_df.loc["ASC (Car)", c] for c in class_cols])
+
+    tt_rank = np.argsort(tt_vals)  # more negative first
+    cost_rank = np.argsort(cost_vals)  # more negative first
+    car_rank = np.argsort(-asc_car_vals)  # higher first
+
+    lines = []
+    lines.append(f"Best model by predictive performance uses K={K} latent classes.")
+    lines.append("Class interpretation:")
+
+    for i, c in enumerate(class_cols):
+        share = profile_df.loc["Class Share", c]
+        tt = profile_df.loc["Travel Time", c]
+        co = profile_df.loc["Travel Cost", c]
+        asc_car = profile_df.loc["ASC (Car)", c]
+        vot = profile_df.loc["VOT (CHF/min)", c]
+
+        tt_pos = int(np.where(tt_rank == i)[0][0]) + 1
+        co_pos = int(np.where(cost_rank == i)[0][0]) + 1
+        car_pos = int(np.where(car_rank == i)[0][0]) + 1
+
+        if asc_car > 0.25:
+            car_pref = "car-preferring segment"
+        elif asc_car < -0.25:
+            car_pref = "non-car segment"
+        else:
+            car_pref = "neutral-to-car segment"
+
+        stability_note = ""
+        if share < 0.03:
+            stability_note += " small-share class;"
+        if abs(co) < 0.15:
+            stability_note += " VOT may be unstable (cost coefficient near zero);"
+        if stability_note:
+            stability_note = f" [{stability_note.strip()}]"
+
+        lines.append(
+            (
+                f"- {c}: share={share:.3f}, {car_pref}; "
+                f"TT={tt:.3f} (time sensitivity rank {tt_pos}/{K}), "
+                f"Cost={co:.3f} (cost sensitivity rank {co_pos}/{K}), "
+                f"ASC(Car)={asc_car:.3f} (car preference rank {car_pos}/{K}), "
+                f"VOT={vot:.3f} CHF/min.{stability_note}"
+            )
+        )
+
+    lines.append("Interpretation note: more negative Travel Time/Travel Cost coefficients imply stronger disutility.")
+    lines.append("VOT is computed as (dU/dTT)/(dU/dCost) after converting from scaled units to raw minutes and CHF.")
+
+    return "\n".join(lines)
+
+
 def predictive_ll_from_guide(guide, train_torch, test_data, K, prior_withconstraints, n_draws=80):
     """Posterior predictive LL on test by log-mean-exp over guide draws."""
     draw_ll = []
@@ -401,6 +507,8 @@ def fit_and_evaluate_k(train_data, test_data, K, prior_withconstraints=True, n_s
 
     beta, asc_raw, gamma = extract_point_estimates(posterior, K, prior_withconstraints)
 
+    _, class_share = class_probs_and_shares(train_data, gamma)
+
     train_ll, train_acc = point_estimate_ll_and_accuracy(train_data, beta, asc_raw, gamma)
     test_ll, test_acc = point_estimate_ll_and_accuracy(test_data, beta, asc_raw, gamma)
 
@@ -427,11 +535,18 @@ def fit_and_evaluate_k(train_data, test_data, K, prior_withconstraints=True, n_s
         "test_LL": test_ll,
         "test_accuracy": test_acc,
         "train_accuracy": train_acc,
+        "beta": beta,
+        "asc_raw": asc_raw,
+        "gamma": gamma,
+        "class_share": class_share,
     }
 
 
 # %%
 def main():
+    output_dir = Path("outputs")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     df = pd.read_csv("swissmetro.csv")
     print(df.head())
     print(df.shape)
@@ -499,15 +614,56 @@ def main():
     )
 
     rows = []
+    profile_long_rows = []
+    profile_tables = {}
+
     for k in range(2, 10):
         print(f"\n--- Fitting K={k} ---")
-        row = fit_and_evaluate_k(
+        fit_result = fit_and_evaluate_k(
             train_data,
             test_data,
             K=k,
             prior_withconstraints=True,
             n_steps=900,
         )
+
+        profile_df = class_profile_table(
+            fit_result["beta"],
+            fit_result["asc_raw"],
+            fit_result["class_share"],
+            tt_std,
+            co_std,
+        )
+        profile_tables[k] = profile_df
+
+        profile_path = output_dir / f"gp_lccm_class_profile_K{k}.csv"
+        profile_df.to_csv(profile_path, index=True)
+
+        for attr in profile_df.index:
+            for cls in profile_df.columns:
+                profile_long_rows.append(
+                    {
+                        "K": k,
+                        "attribute": attr,
+                        "class": cls,
+                        "value": float(profile_df.loc[attr, cls]),
+                    }
+                )
+
+        row = {
+            key: fit_result[key]
+            for key in [
+                "K",
+                "n_params",
+                "log_likelihood",
+                "AIC",
+                "BIC",
+                "prediction_LL",
+                "test_LL",
+                "test_accuracy",
+                "train_accuracy",
+            ]
+        }
         rows.append(row)
 
     results_df = pd.DataFrame(rows).sort_values("K").reset_index(drop=True)
@@ -528,14 +684,39 @@ def main():
         ].to_string(index=False)
     )
 
+    comparison_csv = output_dir / "gp_lccm_comparison_k2_to_k9.csv"
+    results_df.to_csv(comparison_csv, index=False)
+
+    profile_long_df = pd.DataFrame(profile_long_rows)
+    profile_long_csv = output_dir / "gp_lccm_class_profiles_long.csv"
+    profile_long_df.to_csv(profile_long_csv, index=False)
+
     best_pred_idx = results_df["prediction_LL"].idxmax()
     best_acc_idx = results_df["test_accuracy"].idxmax()
+    best_k = int(results_df.loc[best_pred_idx, "K"])
 
     print("\nBest by prediction_LL:")
     print(results_df.loc[[best_pred_idx], ["K", "prediction_LL", "test_accuracy"]].to_string(index=False))
 
     print("\nBest by test_accuracy:")
     print(results_df.loc[[best_acc_idx], ["K", "prediction_LL", "test_accuracy"]].to_string(index=False))
+
+    best_profile_df = profile_tables[best_k]
+    best_profile_path = output_dir / f"gp_lccm_best_model_profile_K{best_k}.csv"
+    best_profile_df.to_csv(best_profile_path, index=True)
+
+    interpretation_text = interpret_best_model(best_k, best_profile_df)
+    interpretation_path = output_dir / f"gp_lccm_best_model_interpretation_K{best_k}.txt"
+    interpretation_path.write_text(interpretation_text)
+
+    print("\nBest model interpretation:")
+    print(interpretation_text)
+
+    print("\nSaved files:")
+    print(f"- {comparison_csv}")
+    print(f"- {profile_long_csv}")
+    print(f"- {best_profile_path}")
+    print(f"- {interpretation_path}")
 
 
 if __name__ == "__main__":
