@@ -162,6 +162,7 @@ def prepare_lccm_data(long_df, id_col="ID", include_GA=True, reference_Z_cols=No
         "alt_id": df["alt_id"].values,
         "choice": df["choice"].values,
         "person_obs_id": person_obs_id,
+        "person_ids": person_df[id_col].values,
         "Z": Z_df.values.astype(float),
         "Z_cols": Z_df.columns.tolist(),
     }
@@ -178,6 +179,7 @@ def to_torch_lccm(data):
         "n_obs": data["n_obs"],
         "n_alts": data["n_alts"],
         "n_persons": data["n_persons"],
+        "person_ids": data["person_ids"],
         "Z_cols": data["Z_cols"],
     }
 
@@ -199,21 +201,36 @@ def lccm_pyro_model(
     """Bayesian LCCM with person-level membership model and class-specific utilities."""
     n_features = X.shape[1]
 
-    gamma = pyro.sample(
-        "gamma",
-        dist.Normal(0.0, 1.5).expand([K - 1, Z.shape[1] + 1]).to_event(2),
+    def matern32_kernel(X1, X2, kappa, lengthscale):
+        dist_matrix = torch.cdist(X1, X2)
+        scaled = np.sqrt(3.0) * dist_matrix / lengthscale
+        return (kappa**2) * (1.0 + scaled) * torch.exp(-scaled)
+
+    kappa = pyro.sample(
+        "kappa",
+        dist.LogNormal(0.0, 0.5).expand([K]).to_event(1),
+    )
+    lengthscale = pyro.sample(
+        "lengthscale",
+        dist.LogNormal(0.0, 0.5).expand([K]).to_event(1),
     )
 
-    Z_aug = torch.cat(
-        [torch.ones(n_persons, 1, dtype=Z.dtype, device=Z.device), Z],
-        dim=1,
-    )
-    eta_nonbase = Z_aug @ gamma.T
-    eta = torch.cat(
-        [eta_nonbase, torch.zeros(n_persons, 1, dtype=Z.dtype, device=Z.device)],
-        dim=1,
-    )
-    log_class_probs = torch.log_softmax(eta, dim=1)
+    f_list = []
+    eye = torch.eye(n_persons, dtype=Z.dtype, device=Z.device)
+    for k in range(K):
+        cov = matern32_kernel(Z, Z, kappa[k], lengthscale[k]) + 1e-4 * eye
+        f_list.append(
+            pyro.sample(
+                f"gp_latent_{k}",
+                dist.MultivariateNormal(
+                    torch.zeros(n_persons, dtype=Z.dtype, device=Z.device),
+                    covariance_matrix=cov,
+                ),
+            )
+        )
+
+    f = torch.stack(f_list, dim=1)
+    log_class_probs = torch.log_softmax(f, dim=1)
 
     if prior_withconstraints:
         beta_raw = pyro.sample(
@@ -259,20 +276,77 @@ def extract_point_estimates(posterior, K, prior_withconstraints):
         beta = posterior["beta"]
 
     asc_raw = posterior["asc_raw"]
-    gamma = posterior["gamma"]
+    kappa = posterior["kappa"]
+    lengthscale = posterior["lengthscale"]
+    gp_latent = torch.stack([posterior[f"gp_latent_{k}"] for k in range(K)], dim=1)
 
     assert beta.shape == (K, 2)
     assert asc_raw.shape[0] == K
-    assert gamma.shape[0] == K - 1
+    assert kappa.shape[0] == K
+    assert lengthscale.shape[0] == K
+    assert gp_latent.shape[1] == K
 
-    return beta.detach().cpu().numpy(), asc_raw.detach().cpu().numpy(), gamma.detach().cpu().numpy()
+    return (
+        beta.detach().cpu().numpy(),
+        asc_raw.detach().cpu().numpy(),
+        kappa.detach().cpu().numpy(),
+        lengthscale.detach().cpu().numpy(),
+        gp_latent.detach().cpu().numpy(),
+    )
 
 
-def mixture_prob_matrix(data, beta, asc_raw, gamma):
+def matern32_kernel_matrix(X1, X2, kappa, lengthscale):
+    dist_matrix = torch.cdist(X1, X2)
+    scaled = np.sqrt(3.0) * dist_matrix / lengthscale
+    return (kappa**2) * (1.0 + scaled) * torch.exp(-scaled)
+
+
+def gp_predict_latent(train_Z, train_f, target_Z, kappa, lengthscale):
+    train_Z_t = torch.tensor(train_Z, dtype=torch.float32)
+    train_f_t = torch.tensor(train_f, dtype=torch.float32)
+    target_Z_t = torch.tensor(target_Z, dtype=torch.float32)
+    kappa_t = torch.tensor(float(kappa), dtype=torch.float32)
+    lengthscale_t = torch.tensor(float(lengthscale), dtype=torch.float32)
+
+    k_tt = matern32_kernel_matrix(train_Z_t, train_Z_t, kappa_t, lengthscale_t)
+    k_tt = k_tt + 1e-4 * torch.eye(k_tt.shape[0], dtype=torch.float32)
+    k_ts = matern32_kernel_matrix(train_Z_t, target_Z_t, kappa_t, lengthscale_t)
+
+    alpha = torch.linalg.solve(k_tt, train_f_t)
+    pred_mean = k_ts.T @ alpha
+    return pred_mean
+
+
+def class_probs_from_gp(train_data, posterior, K, target_data=None):
+    if target_data is None:
+        target_data = train_data
+
+    _, _, kappa, lengthscale, gp_latent = extract_point_estimates(posterior, K, prior_withconstraints=True)
+
+    if target_data is train_data:
+        logits = gp_latent
+    else:
+        logits_list = []
+        for k in range(K):
+            pred_mean = gp_predict_latent(
+                train_data["Z"],
+                gp_latent[:, k],
+                target_data["Z"],
+                kappa[k],
+                lengthscale[k],
+            )
+            logits_list.append(pred_mean)
+        logits = np.column_stack([col.detach().cpu().numpy() if torch.is_tensor(col) else col for col in logits_list])
+
+    class_probs = np.exp(logits - logsumexp(logits, axis=1, keepdims=True))
+    class_share = class_probs.mean(axis=0)
+    return class_probs, class_share
+
+
+def mixture_prob_matrix(data, beta, asc_raw, class_probs):
     """Return mixture choice probabilities per observation and alternative."""
     n_obs = data["n_obs"]
     n_alts = data["n_alts"]
-    n_persons = data["n_persons"]
     K = beta.shape[0]
 
     X = np.column_stack([data["tt"], data["co"]])
@@ -281,11 +355,6 @@ def mixture_prob_matrix(data, beta, asc_raw, gamma):
     person_obs_id = data["person_obs_id"]
 
     asc_full = np.column_stack([np.zeros(K), asc_raw])
-
-    Z_aug = np.column_stack([np.ones(n_persons), data["Z"]])
-    eta_nonbase = Z_aug @ gamma.T
-    eta = np.column_stack([eta_nonbase, np.zeros(n_persons)])
-    class_probs = np.exp(eta - logsumexp(eta, axis=1, keepdims=True))
 
     class_choice_probs = np.zeros((n_obs, K, n_alts), dtype=float)
 
@@ -314,8 +383,8 @@ def chosen_alt_per_obs(data):
     return y_wide
 
 
-def point_estimate_ll_and_accuracy(data, beta, asc_raw, gamma):
-    probs = mixture_prob_matrix(data, beta, asc_raw, gamma)
+def point_estimate_ll_and_accuracy(data, beta, asc_raw, class_probs):
+    probs = mixture_prob_matrix(data, beta, asc_raw, class_probs)
     y_true = chosen_alt_per_obs(data)
 
     chosen_p = probs[np.arange(len(y_true)), y_true]
@@ -328,17 +397,7 @@ def point_estimate_ll_and_accuracy(data, beta, asc_raw, gamma):
 
 
 def parameter_count(K, n_alts, n_Z):
-    return K * 2 + K * (n_alts - 1) + (K - 1) * (n_Z + 1)
-
-
-def class_probs_and_shares(data, gamma):
-    n_persons = data["n_persons"]
-    Z_aug = np.column_stack([np.ones(n_persons), data["Z"]])
-    eta_nonbase = Z_aug @ gamma.T
-    eta = np.column_stack([eta_nonbase, np.zeros(n_persons)])
-    class_probs = np.exp(eta - logsumexp(eta, axis=1, keepdims=True))
-    class_share = class_probs.mean(axis=0)
-    return class_probs, class_share
+    return K * 2 + K * (n_alts - 1) + 2 * K
 
 
 def class_profile_table(beta, asc_raw, class_share, tt_std, co_std):
@@ -436,43 +495,41 @@ def interpret_best_model(K, profile_df):
     return "\n".join(lines)
 
 
-def predictive_ll_from_guide(guide, train_torch, test_data, K, prior_withconstraints, n_draws=80):
-    """Posterior predictive LL on test by log-mean-exp over guide draws."""
-    draw_ll = []
-
-    for _ in range(n_draws):
-        sample = guide(
-            train_torch["X"],
-            train_torch["obs_id"],
-            train_torch["alt_id"],
-            train_torch["choice"],
-            train_torch["person_obs_id"],
-            train_torch["Z"],
-            train_torch["n_obs"],
-            train_torch["n_alts"],
-            train_torch["n_persons"],
-            K=K,
-            prior_withconstraints=prior_withconstraints,
-        )
-
-        beta, asc_raw, gamma = extract_point_estimates(sample, K, prior_withconstraints)
-        ll_i, _ = point_estimate_ll_and_accuracy(test_data, beta, asc_raw, gamma)
-        draw_ll.append(ll_i)
-
-    draw_ll = np.asarray(draw_ll)
-    return float(logsumexp(draw_ll) - np.log(len(draw_ll)))
-
-
 # %%
-def fit_and_evaluate_k(train_data, test_data, K, prior_withconstraints=True, n_steps=900):
+def fit_and_evaluate_k(train_data, test_data, K, prior_withconstraints=True, n_steps=250):
     train_torch = to_torch_lccm(train_data)
 
     pyro.clear_param_store()
     pyro.set_rng_seed(42 + K)
 
-    guide = AutoNormal(lccm_pyro_model)
+    def model_fn(
+        X,
+        obs_id,
+        alt_id,
+        choice,
+        person_obs_id,
+        Z,
+        n_obs,
+        n_alts,
+        n_persons,
+    ):
+        return lccm_pyro_model(
+            X,
+            obs_id,
+            alt_id,
+            choice,
+            person_obs_id,
+            Z,
+            n_obs,
+            n_alts,
+            n_persons,
+            K=K,
+            prior_withconstraints=prior_withconstraints,
+        )
+
+    guide = AutoNormal(model_fn)
     optimizer = ClippedAdam({"lr": 0.03, "lrd": 0.9995})
-    svi = SVI(lccm_pyro_model, guide, optimizer, loss=Trace_ELBO())
+    svi = SVI(model_fn, guide, optimizer, loss=Trace_ELBO())
 
     for step in range(n_steps):
         loss = svi.step(
@@ -485,10 +542,8 @@ def fit_and_evaluate_k(train_data, test_data, K, prior_withconstraints=True, n_s
             train_torch["n_obs"],
             train_torch["n_alts"],
             train_torch["n_persons"],
-            K=K,
-            prior_withconstraints=prior_withconstraints,
         )
-        if step % 300 == 0 or step == n_steps - 1:
+        if step % 100 == 0 or step == n_steps - 1:
             print(f"[K={K}] step {step:4d} | ELBO loss = {loss:,.2f}")
 
     posterior = guide.median(
@@ -501,25 +556,17 @@ def fit_and_evaluate_k(train_data, test_data, K, prior_withconstraints=True, n_s
         train_torch["n_obs"],
         train_torch["n_alts"],
         train_torch["n_persons"],
-        K=K,
-        prior_withconstraints=prior_withconstraints,
     )
 
-    beta, asc_raw, gamma = extract_point_estimates(posterior, K, prior_withconstraints)
+    beta, asc_raw, kappa, lengthscale, gp_latent = extract_point_estimates(posterior, K, prior_withconstraints)
 
-    _, class_share = class_probs_and_shares(train_data, gamma)
+    train_class_probs, class_share = class_probs_from_gp(train_data, posterior, K, target_data=train_data)
+    test_class_probs, _ = class_probs_from_gp(train_data, posterior, K, target_data=test_data)
 
-    train_ll, train_acc = point_estimate_ll_and_accuracy(train_data, beta, asc_raw, gamma)
-    test_ll, test_acc = point_estimate_ll_and_accuracy(test_data, beta, asc_raw, gamma)
+    train_ll, train_acc = point_estimate_ll_and_accuracy(train_data, beta, asc_raw, train_class_probs)
+    test_ll, test_acc = point_estimate_ll_and_accuracy(test_data, beta, asc_raw, test_class_probs)
 
-    pred_ll = predictive_ll_from_guide(
-        guide,
-        train_torch,
-        test_data,
-        K,
-        prior_withconstraints,
-        n_draws=80,
-    )
+    pred_ll = test_ll
 
     n_params = parameter_count(K, train_data["n_alts"], train_data["Z"].shape[1])
     aic = 2 * n_params - 2 * train_ll
@@ -537,8 +584,12 @@ def fit_and_evaluate_k(train_data, test_data, K, prior_withconstraints=True, n_s
         "train_accuracy": train_acc,
         "beta": beta,
         "asc_raw": asc_raw,
-        "gamma": gamma,
+        "kappa": kappa,
+        "lengthscale": lengthscale,
+        "gp_latent": gp_latent,
         "class_share": class_share,
+        "train_class_probs": train_class_probs,
+        "test_class_probs": test_class_probs,
     }
 
 
@@ -616,6 +667,7 @@ def main():
     rows = []
     profile_long_rows = []
     profile_tables = {}
+    fit_results = {}
 
     for k in range(2, 10):
         print(f"\n--- Fitting K={k} ---")
@@ -624,8 +676,8 @@ def main():
             test_data,
             K=k,
             prior_withconstraints=True,
-            n_steps=900,
         )
+        fit_results[k] = fit_result
 
         profile_df = class_profile_table(
             fit_result["beta"],
@@ -705,6 +757,27 @@ def main():
     best_profile_path = output_dir / f"gp_lccm_best_model_profile_K{best_k}.csv"
     best_profile_df.to_csv(best_profile_path, index=True)
 
+    best_fit = fit_results[best_k]
+    person_prob_rows = []
+
+    for dataset_name, dataset_data, probs in [
+        ("train", train_data, best_fit["train_class_probs"]),
+        ("test", test_data, best_fit["test_class_probs"]),
+    ]:
+        for idx, person_id in enumerate(dataset_data["person_ids"]):
+            row = {
+                "dataset": dataset_name,
+                "ID": person_id,
+                "predicted_class": int(np.argmax(probs[idx]) + 1),
+            }
+            for k in range(probs.shape[1]):
+                row[f"class_{k + 1}_prob"] = float(probs[idx, k])
+            person_prob_rows.append(row)
+
+    person_prob_df = pd.DataFrame(person_prob_rows)
+    person_prob_csv = output_dir / f"gp_lccm_person_class_probs_bestK{best_k}.csv"
+    person_prob_df.to_csv(person_prob_csv, index=False)
+
     interpretation_text = interpret_best_model(best_k, best_profile_df)
     interpretation_path = output_dir / f"gp_lccm_best_model_interpretation_K{best_k}.txt"
     interpretation_path.write_text(interpretation_text)
@@ -716,6 +789,7 @@ def main():
     print(f"- {comparison_csv}")
     print(f"- {profile_long_csv}")
     print(f"- {best_profile_path}")
+    print(f"- {person_prob_csv}")
     print(f"- {interpretation_path}")
 
 
