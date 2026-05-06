@@ -242,7 +242,15 @@ def lccm_pyro_model(
         )
 
     f = torch.stack(f_list, dim=1)
-    log_class_probs = torch.log_softmax(f, dim=1)
+
+    # Break class-label symmetry so SVI does not collapse to equal shares.
+    class_intercept_loc = torch.linspace(-0.4, 0.4, K, dtype=Z.dtype, device=Z.device)
+    class_intercept = pyro.sample(
+        "class_intercept",
+        dist.Normal(class_intercept_loc, 0.3).to_event(1),
+    )
+    class_intercept = class_intercept.to(device=Z.device, dtype=Z.dtype)
+    log_class_probs = torch.log_softmax(f + class_intercept.unsqueeze(0), dim=1)
 
     if prior_withconstraints:
         beta_raw = pyro.sample(
@@ -293,12 +301,14 @@ def extract_point_estimates(posterior, K, prior_withconstraints):
     asc_raw = posterior["asc_raw"]
     kappa = posterior["kappa"]
     lengthscale = posterior["lengthscale"]
+    class_intercept = posterior["class_intercept"]
     gp_latent = torch.stack([posterior[f"gp_latent_{k}"] for k in range(K)], dim=1)
 
     assert beta.shape == (K, 2)
     assert asc_raw.shape[0] == K
     assert kappa.shape[0] == K
     assert lengthscale.shape[0] == K
+    assert class_intercept.shape[0] == K
     assert gp_latent.shape[1] == K
 
     return (
@@ -306,6 +316,7 @@ def extract_point_estimates(posterior, K, prior_withconstraints):
         asc_raw.detach().cpu().numpy(),
         kappa.detach().cpu().numpy(),
         lengthscale.detach().cpu().numpy(),
+        class_intercept.detach().cpu().numpy(),
         gp_latent.detach().cpu().numpy(),
     )
 
@@ -336,10 +347,12 @@ def class_probs_from_gp(train_data, posterior, K, target_data=None):
     if target_data is None:
         target_data = train_data
 
-    _, _, kappa, lengthscale, gp_latent = extract_point_estimates(posterior, K, prior_withconstraints=True)
+    _, _, kappa, lengthscale, class_intercept, gp_latent = extract_point_estimates(
+        posterior, K, prior_withconstraints=True
+    )
 
     if target_data is train_data:
-        logits = gp_latent
+        logits = gp_latent + class_intercept[None, :]
     else:
         logits_list = []
         for k in range(K):
@@ -351,7 +364,10 @@ def class_probs_from_gp(train_data, posterior, K, target_data=None):
                 lengthscale[k],
             )
             logits_list.append(pred_mean)
-        logits = np.column_stack([col.detach().cpu().numpy() if torch.is_tensor(col) else col for col in logits_list])
+        logits = np.column_stack(
+            [col.detach().cpu().numpy() if torch.is_tensor(col) else col for col in logits_list]
+        )
+        logits = logits + class_intercept[None, :]
 
     class_probs = np.exp(logits - logsumexp(logits, axis=1, keepdims=True))
     class_share = class_probs.mean(axis=0)
@@ -511,7 +527,7 @@ def interpret_best_model(K, profile_df):
 
 
 # %%
-def fit_and_evaluate_k(train_data, test_data, K, prior_withconstraints=True, n_steps=1000):
+def fit_and_evaluate_k(train_data, test_data, K, prior_withconstraints=True, n_steps=3000):
     train_torch = to_torch_lccm(train_data)
 
     pyro.clear_param_store()
@@ -558,7 +574,7 @@ def fit_and_evaluate_k(train_data, test_data, K, prior_withconstraints=True, n_s
             train_torch["n_alts"],
             train_torch["n_persons"],
         )
-        if step % max(1, n_steps // 3) == 0 or step == n_steps - 1:
+        if step % max(1, n_steps // 100) == 0 or step == n_steps - 1:
             print(f"[K={K}] step {step:4d} | ELBO loss = {loss:,.2f}")
 
     posterior = guide.median(
@@ -573,15 +589,15 @@ def fit_and_evaluate_k(train_data, test_data, K, prior_withconstraints=True, n_s
         train_torch["n_persons"],
     )
 
-    beta, asc_raw, kappa, lengthscale, gp_latent = extract_point_estimates(posterior, K, prior_withconstraints)
+    beta, asc_raw, kappa, lengthscale, class_intercept, gp_latent = extract_point_estimates(
+        posterior, K, prior_withconstraints
+    )
 
     train_class_probs, class_share = class_probs_from_gp(train_data, posterior, K, target_data=train_data)
     test_class_probs, _ = class_probs_from_gp(train_data, posterior, K, target_data=test_data)
 
     train_ll, train_acc = point_estimate_ll_and_accuracy(train_data, beta, asc_raw, train_class_probs)
     test_ll, test_acc = point_estimate_ll_and_accuracy(test_data, beta, asc_raw, test_class_probs)
-
-    pred_ll = test_ll
 
     n_params = parameter_count(K, train_data["n_alts"], train_data["Z"].shape[1])
     aic = 2 * n_params - 2 * train_ll
@@ -593,14 +609,14 @@ def fit_and_evaluate_k(train_data, test_data, K, prior_withconstraints=True, n_s
         "log_likelihood": train_ll,
         "AIC": aic,
         "BIC": bic,
-        "prediction_LL": pred_ll,
-        "test_LL": test_ll,
+        "prediction_LL": test_ll,
         "test_accuracy": test_acc,
         "train_accuracy": train_acc,
         "beta": beta,
         "asc_raw": asc_raw,
         "kappa": kappa,
         "lengthscale": lengthscale,
+        "class_intercept": class_intercept,
         "gp_latent": gp_latent,
         "class_share": class_share,
         "train_class_probs": train_class_probs,
@@ -684,7 +700,8 @@ def main():
     profile_tables = {}
     fit_results = {}
 
-    for k in range(2, 10):
+    k_values = list(range(2, 8))
+    for k in k_values:
         print(f"\n--- Fitting K={k} ---")
         fit_result = fit_and_evaluate_k(
             train_data,
@@ -726,7 +743,6 @@ def main():
                 "AIC",
                 "BIC",
                 "prediction_LL",
-                "test_LL",
                 "test_accuracy",
                 "train_accuracy",
             ]
@@ -735,7 +751,8 @@ def main():
 
     results_df = pd.DataFrame(rows).sort_values("K").reset_index(drop=True)
 
-    print("\nModel comparison table (K=2..9):")
+    print(f"\nModel comparison table (K={min(k_values)}..{max(k_values)}):")
+
     print(
         results_df[
             [
@@ -745,13 +762,12 @@ def main():
                 "AIC",
                 "BIC",
                 "prediction_LL",
-                "test_LL",
                 "test_accuracy",
             ]
         ].to_string(index=False)
     )
 
-    comparison_csv = output_dir / "gp_lccm_comparison_k2_to_k9.csv"
+    comparison_csv = output_dir / "gp_lccm_comparison_k2_to_k7.csv"
     results_df.to_csv(comparison_csv, index=False)
 
     profile_long_df = pd.DataFrame(profile_long_rows)
